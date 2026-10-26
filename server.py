@@ -1,97 +1,153 @@
-import os, asyncio, logging
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
-from contextlib import asynccontextmanager
+import os
+from datetime import date, timedelta
+from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
+import requests
 
-import aiohttp
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
-from aiogram import Bot, Dispatcher
-from aiogram.filters import CommandStart
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
-from dotenv import load_dotenv
+app = FastAPI(title="Football Live API")
 
-load_dotenv()
-BOT_TOKEN=os.getenv("BOT_TOKEN","").strip()
-FOOTBALL_DATA_TOKEN=os.getenv("FOOTBALL_DATA_TOKEN","").strip()
-WEBAPP_URL=os.getenv("WEBAPP_URL","").strip()
-PORT=int(os.getenv("PORT","8000"))
-API_BASE="https://api.football-data.org/v4"
-TZ=ZoneInfo("Asia/Tehran")
-logging.basicConfig(level=logging.INFO)
-dp=Dispatcher()
-COMPETITIONS={"PL":"لیگ برتر انگلیس","PD":"لالیگا","BL1":"بوندس‌لیگا","SA":"سری‌آ ایتالیا","FL1":"لیگ یک فرانسه","CL":"لیگ قهرمانان اروپا","DED":"اردیویسه هلند","PPL":"لیگ پرتغال"}
-bot_task=None
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-async def get_matches():
-    if not FOOTBALL_DATA_TOKEN:
-        raise HTTPException(status_code=503,detail="FOOTBALL_DATA_TOKEN تنظیم نشده است.")
-    now=datetime.now(TZ)
-    start=now.date()
-    end=start+timedelta(days=6)
-    headers={"X-Auth-Token":FOOTBALL_DATA_TOKEN}
-    timeout=aiohttp.ClientTimeout(total=22)
-    found=[]; errors=[]
-    async with aiohttp.ClientSession(headers=headers,timeout=timeout) as session:
-        for code, league in COMPETITIONS.items():
-            try:
-                async with session.get(f"{API_BASE}/competitions/{code}/matches",params={"dateFrom":start.isoformat(),"dateTo":end.isoformat()}) as resp:
-                    if resp.status in (403,404):
-                        errors.append(code); continue
-                    if resp.status==429:
-                        raise HTTPException(status_code=429,detail="سقف درخواست API پر شده؛ کمی بعد دوباره تلاش کن.")
-                    if resp.status>=400:
-                        errors.append(code);continue
-                    data=await resp.json()
-                    for m in data.get("matches",[]):
-                        m["competition"]={"name":league}
-                        found.append(m)
-            except HTTPException: raise
-            except Exception as e:
-                logging.warning("API issue for %s: %s",code,e);errors.append(code)
-    unique={m.get("id"):m for m in found if m.get("id") is not None}
-    matches=list(unique.values())
-    matches.sort(key=lambda x:x.get("utcDate",""))
-    return {"matches":matches,"from":start.isoformat(),"to":end.isoformat(),"timezone":"Asia/Tehran","limited_competitions":errors}
+API_URL = "https://api.football-data.org/v4"
 
-@dp.message(CommandStart())
-async def start(message:Message):
-    keyboard=None
-    if WEBAPP_URL.startswith("https://"):
-        keyboard=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚽ مشاهده برنامه و نتایج فوتبال",web_app=WebAppInfo(url=WEBAPP_URL))]])
-    text_msg=("سلام! به فوتبال‌لایو خوش اومدی ⚽\n\n"
-              "برنامه بازی‌های ۷ روز آینده، روز و تاریخ، ساعت ایران و نتیجه مسابقات را در نسخه وب ببین.\n"
-              "نتایج زنده به پوشش و زمان به‌روزرسانی منبع داده بستگی دارد.")
-    await message.answer(text_msg,reply_markup=keyboard)
+COMPETITIONS = {
+    "PL": "لیگ برتر انگلیس",
+    "ELC": "چمپیونشیپ انگلیس",
+    "PD": "لالیگای اسپانیا",
+    "BL1": "بوندسلیگای آلمان",
+    "SA": "سری آ ایتالیا",
+    "FL1": "لیگ فرانسه",
+    "DED": "اردیویسه هلند",
+    "PPL": "لیگ پرتغال",
+    "CL": "لیگ قهرمانان اروپا",
+    "BSA": "سری آ برزیل",
+}
 
-@dp.message()
-async def fallback(message:Message):
-    if message.text and message.text.startswith("/"):
-        await message.answer("برای دیدن برنامه و نتایج فوتبال، دستور /start را بزن.")
 
-@asynccontextmanager
-async def lifespan(app:FastAPI):
-    global bot_task
-    if BOT_TOKEN:
-        bot_task=asyncio.create_task(dp.start_polling(Bot(BOT_TOKEN)))
-    else:
-        logging.warning("BOT_TOKEN not set; website API can still run.")
-    yield
-    if bot_task:
-        bot_task.cancel()
-        try: await bot_task
-        except asyncio.CancelledError: pass
+def get_token():
+    return (
+        os.getenv("FOOTBALL_DATA_TOKEN")
+        or os.getenv("API_TOKEN")
+        or os.getenv("FOOTBALL_API_KEY")
+    )
 
-app=FastAPI(title="Football Live Mini App",lifespan=lifespan)
-@app.get("/")
-async def index():
-    return FileResponse("index.html")
+
 @app.get("/health")
-async def health():
-    return {"ok":True}
+def health():
+    return {
+        "ok": True,
+        "token_configured": bool(get_token()),
+    }
+
+
+@app.get("/api/competitions")
+def competitions():
+    return {
+        "competitions": [
+            {"code": code, "name": name}
+            for code, name in COMPETITIONS.items()
+        ]
+    }
+
+
 @app.get("/api/matches")
-async def matches():
-    return await get_matches()
-if __name__=="__main__":
-    import uvicorn
-    uvicorn.run("server:app",host="0.0.0.0",port=PORT)
+def matches(
+    dateFrom: date = Query(default=None),
+    dateTo: date = Query(default=None),
+    competition: str = Query(default=None),
+):
+    token = get_token()
+
+    if not token:
+        return {
+            "ok": False,
+            "error": "API token is not configured on the server",
+            "matches": [],
+        }
+
+    start = dateFrom or date.today()
+    end = dateTo or start
+
+    if end < start:
+        return {
+            "ok": False,
+            "error": "تاریخ پایان نباید قبل از تاریخ شروع باشد",
+            "matches": [],
+        }
+
+    # football-data.org treats dateTo as inclusive for our requested range
+    # by passing the following day as the exclusive boundary.
+    params = {
+        "dateFrom": start.isoformat(),
+        "dateTo": (end + timedelta(days=1)).isoformat(),
+    }
+
+    codes = (
+        [competition.upper()]
+        if competition and competition.upper() in COMPETITIONS
+        else list(COMPETITIONS.keys())
+    )
+    params["competitions"] = ",".join(codes)
+
+    try:
+        response = requests.get(
+            f"{API_URL}/matches",
+            headers={"X-Auth-Token": token},
+            params=params,
+            timeout=25,
+        )
+
+        if response.status_code != 200:
+            return {
+                "ok": False,
+                "error": f"Football API error: {response.status_code}",
+                "details": response.text[:500],
+                "matches": [],
+            }
+
+        data = response.json()
+        results = []
+
+        for match in data.get("matches", []):
+            comp = match.get("competition") or {}
+            home = match.get("homeTeam") or {}
+            away = match.get("awayTeam") or {}
+            score = match.get("score") or {}
+            full_time = score.get("fullTime") or {}
+
+            results.append({
+                "id": match.get("id"),
+                "utcDate": match.get("utcDate"),
+                "status": match.get("status"),
+                "competition": comp.get("name", ""),
+                "competitionCode": comp.get("code", ""),
+                "homeTeam": home.get("name", "نامشخص"),
+                "awayTeam": away.get("name", "نامشخص"),
+                "homeScore": full_time.get("home"),
+                "awayScore": full_time.get("away"),
+            })
+
+        results.sort(key=lambda item: item.get("utcDate") or "")
+
+        return {
+            "ok": True,
+            "matches": results,
+            "count": len(results),
+            "from": start.isoformat(),
+            "to": end.isoformat(),
+            "timezone": "Asia/Tehran",
+            "competitions": COMPETITIONS,
+        }
+
+    except requests.RequestException as exc:
+        return {
+            "ok": False,
+            "error": "اتصال به سرویس مسابقات ناموفق بود",
+            "details": str(exc),
+            "matches": [],
+        }
