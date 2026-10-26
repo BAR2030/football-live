@@ -1,11 +1,13 @@
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import httpx
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-import requests
+from fastapi.responses import HTMLResponse
 
-app = FastAPI(title="Football Live API")
-
+app = FastAPI(title="Football Live")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -13,141 +15,111 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-API_URL = "https://api.football-data.org/v4"
+API = "https://api.football-data.org/v4"
+TZ = ZoneInfo("Asia/Tehran")
+TOKEN = (
+    os.getenv("FOOTBALL_DATA_TOKEN", "").strip()
+    or os.getenv("API_TOKEN", "").strip()
+    or os.getenv("FOOTBALL_API_KEY", "").strip()
+)
 
-COMPETITIONS = {
-    "PL": "لیگ برتر انگلیس",
-    "ELC": "چمپیونشیپ انگلیس",
-    "PD": "لالیگای اسپانیا",
-    "BL1": "بوندسلیگای آلمان",
-    "SA": "سری آ ایتالیا",
-    "FL1": "لیگ فرانسه",
-    "DED": "اردیویسه هلند",
-    "PPL": "لیگ پرتغال",
-    "CL": "لیگ قهرمانان اروپا",
-    "BSA": "سری آ برزیل",
-}
-
-
-def get_token():
-    return (
-        os.getenv("FOOTBALL_DATA_TOKEN")
-        or os.getenv("API_TOKEN")
-        or os.getenv("FOOTBALL_API_KEY")
-    )
-
+COMPETITIONS = [
+    {"code": "PL", "name": "لیگ برتر انگلیس"},
+    {"code": "ELC", "name": "چمپیونشیپ انگلیس"},
+    {"code": "PD", "name": "لالیگا اسپانیا"},
+    {"code": "BL1", "name": "بوندس‌لیگا آلمان"},
+    {"code": "SA", "name": "سری آ ایتالیا"},
+    {"code": "FL1", "name": "لیگ فرانسه"},
+    {"code": "DED", "name": "اردیویسه هلند"},
+    {"code": "PPL", "name": "لیگ پرتغال"},
+    {"code": "CL", "name": "لیگ قهرمانان اروپا"},
+    {"code": "BSA", "name": "سری آ برزیل"},
+]
 
 @app.get("/health")
-def health():
-    return {
-        "ok": True,
-        "token_configured": bool(get_token()),
-    }
-
+async def health():
+    return {"ok": True, "token_configured": bool(TOKEN)}
 
 @app.get("/api/competitions")
-def competitions():
-    return {
-        "competitions": [
-            {"code": code, "name": name}
-            for code, name in COMPETITIONS.items()
-        ]
-    }
-
+async def competitions():
+    return {"competitions": COMPETITIONS}
 
 @app.get("/api/matches")
-def matches(
-    dateFrom: date = Query(default=None),
-    dateTo: date = Query(default=None),
-    competition: str = Query(default=None),
+async def matches(
+    dateFrom: date = Query(...),
+    dateTo: date = Query(...),
+    competition: str = Query(default="ALL"),
 ):
-    token = get_token()
-
-    if not token:
+    if not TOKEN:
         return {
-            "ok": False,
-            "error": "API token is not configured on the server",
+            "error": "توکن فوتبال در تنظیمات Render ثبت نشده است (FOOTBALL_DATA_TOKEN).",
             "matches": [],
         }
+    if dateTo < dateFrom:
+        return {"error": "تاریخ پایان نامعتبر است.", "matches": []}
 
-    start = dateFrom or date.today()
-    end = dateTo or start
-
-    if end < start:
-        return {
-            "ok": False,
-            "error": "تاریخ پایان نباید قبل از تاریخ شروع باشد",
-            "matches": [],
-        }
-
-    # football-data.org treats dateTo as inclusive for our requested range
-    # by passing the following day as the exclusive boundary.
     params = {
-        "dateFrom": start.isoformat(),
-        "dateTo": (end + timedelta(days=1)).isoformat(),
+        "dateFrom": dateFrom.isoformat(),
+        # Send the next day as the exclusive upper boundary.
+        "dateTo": (dateTo + timedelta(days=1)).isoformat(),
     }
-
-    codes = (
-        [competition.upper()]
-        if competition and competition.upper() in COMPETITIONS
-        else list(COMPETITIONS.keys())
-    )
-    params["competitions"] = ",".join(codes)
+    if competition and competition.upper() != "ALL":
+        params["competitions"] = competition.upper()
 
     try:
-        response = requests.get(
-            f"{API_URL}/matches",
-            headers={"X-Auth-Token": token},
-            params=params,
-            timeout=25,
-        )
+        async with httpx.AsyncClient(timeout=25) as client:
+            response = await client.get(
+                f"{API}/matches",
+                params=params,
+                headers={"X-Auth-Token": TOKEN},
+            )
 
         if response.status_code != 200:
             return {
-                "ok": False,
-                "error": f"Football API error: {response.status_code}",
-                "details": response.text[:500],
+                "error": f"خطای سرویس مسابقات (HTTP {response.status_code})",
+                "details": response.text[:400],
                 "matches": [],
             }
 
-        data = response.json()
-        results = []
-
-        for match in data.get("matches", []):
-            comp = match.get("competition") or {}
+        matches_out = []
+        for match in response.json().get("matches", []):
+            competition_data = match.get("competition") or {}
             home = match.get("homeTeam") or {}
             away = match.get("awayTeam") or {}
-            score = match.get("score") or {}
-            full_time = score.get("fullTime") or {}
+            full_time = ((match.get("score") or {}).get("fullTime") or {})
+            raw_date = match.get("utcDate")
+            local_time = ""
+            if raw_date:
+                local_time = datetime.fromisoformat(
+                    raw_date.replace("Z", "+00:00")
+                ).astimezone(TZ).strftime("%H:%M")
 
-            results.append({
+            matches_out.append({
                 "id": match.get("id"),
-                "utcDate": match.get("utcDate"),
-                "status": match.get("status"),
-                "competition": comp.get("name", ""),
-                "competitionCode": comp.get("code", ""),
+                "competition": competition_data.get("name", ""),
+                "competitionCode": competition_data.get("code", ""),
                 "homeTeam": home.get("name", "نامشخص"),
                 "awayTeam": away.get("name", "نامشخص"),
+                "localTime": local_time,
+                "status": match.get("status", ""),
                 "homeScore": full_time.get("home"),
                 "awayScore": full_time.get("away"),
             })
 
-        results.sort(key=lambda item: item.get("utcDate") or "")
-
+        matches_out.sort(key=lambda item: item.get("localTime") or "")
         return {
             "ok": True,
-            "matches": results,
-            "count": len(results),
-            "from": start.isoformat(),
-            "to": end.isoformat(),
+            "matches": matches_out,
+            "count": len(matches_out),
+            "from": dateFrom.isoformat(),
+            "to": dateTo.isoformat(),
             "timezone": "Asia/Tehran",
-            "competitions": COMPETITIONS,
         }
+    except httpx.RequestError:
+        return {"error": "ارتباط با سرویس مسابقات برقرار نشد.", "matches": []}
 
-    except requests.RequestException as exc:
-        return {
-            "ok": False,
-            "error": "اتصال به سرویس مسابقات ناموفق بود",
-            "details": str(exc),
-            "matches": [],
-        }
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    path = os.path.join(os.path.dirname(__file__), "index.html")
+    with open(path, encoding="utf-8") as file:
+        return file.read()
